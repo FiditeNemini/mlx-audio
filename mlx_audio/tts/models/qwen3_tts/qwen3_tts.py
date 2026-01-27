@@ -7,10 +7,17 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    categorical_sampling,
+)
+from tqdm import tqdm
 
 from mlx_audio.dsp import mel_filters, stft
 from mlx_audio.tts.models.base import GenerationResult
+from mlx_audio.utils import load_audio
 
 from .config import (
     ModelConfig,
@@ -52,7 +59,7 @@ def mel_spectrogram(
 
     # Compute STFT for each sample in batch
     mels = []
-    padding = n_fft // 2
+    padding = (n_fft - hop_size) // 2
     for i in range(batch_size):
         # Manual reflect padding to match PyTorch reference (center=False with manual pad)
         sample = audio[i]
@@ -231,9 +238,12 @@ class Model(nn.Module):
             fmin=0,
             fmax=12000,
         )  # [batch, time, mels]
+        mx.eval(mels)
 
         # Extract embedding
         speaker_embedding = self.speaker_encoder(mels)
+        mx.eval(speaker_embedding)
+
         return speaker_embedding
 
     def _prepare_generation_inputs(
@@ -269,7 +279,7 @@ class Model(nn.Module):
         chat_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
         input_ids = mx.array(self.tokenizer.encode(chat_text))[None, :]
 
-        # Get text embeddings
+        # Get text embeddings (computed once, sliced later for efficiency)
         text_embed = self.talker.text_projection(
             self.talker.get_text_embeddings()(input_ids)
         )
@@ -361,9 +371,7 @@ class Model(nn.Module):
             )
 
         # Role embedding (first 3 tokens: <|im_start|>assistant\n)
-        role_embed = self.talker.text_projection(
-            self.talker.get_text_embeddings()(input_ids[:, :3])
-        )
+        role_embed = text_embed[:, :3, :]
 
         # Combine embeddings
         # tts_pad * (codec_len - 2) + tts_bos
@@ -383,23 +391,13 @@ class Model(nn.Module):
         else:
             input_embeds = mx.concatenate([role_embed, combined_embed], axis=1)
 
-        # Add first text token
-        first_text_embed = (
-            self.talker.text_projection(
-                self.talker.get_text_embeddings()(input_ids[:, 3:4])
-            )
-            + codec_embed[:, -1:, :]
-        )
+        # Add first text token (token index 3)
+        first_text_embed = text_embed[:, 3:4, :] + codec_embed[:, -1:, :]
         input_embeds = mx.concatenate([input_embeds, first_text_embed], axis=1)
 
-        # Trailing text (rest of the text)
+        # Trailing text (tokens 4 to -5, plus EOS)
         trailing_text_hidden = mx.concatenate(
-            [
-                self.talker.text_projection(
-                    self.talker.get_text_embeddings()(input_ids[:, 4:-5])
-                ),
-                tts_eos_embed,
-            ],
+            [text_embed[:, 4:-5, :], tts_eos_embed],
             axis=1,
         )
 
@@ -601,80 +599,90 @@ class Model(nn.Module):
         generated_tokens: Optional[List[int]] = None,
         suppress_tokens: Optional[List[int]] = None,
         eos_token_id: Optional[int] = None,
+        min_p: float = 0.0,
     ) -> mx.array:
-        """Sample next token from logits."""
-        logits = logits[:, -1, :]  # Get last position
 
-        # Suppress invalid tokens (set to -inf)
+        logits = logits[:, -1, :]  # Get last position [1, vocab_size]
+
+        # Suppress invalid tokens (set to -inf) - pure MLX
         if suppress_tokens:
-            logits_np = np.array(logits.astype(mx.float32))
-            logits_np[:, suppress_tokens] = float("-inf")
-            logits = mx.array(logits_np)
+            suppress_idx = mx.array(suppress_tokens, dtype=mx.int32)
+            logits = mx.put_along_axis(
+                logits,
+                suppress_idx[None, :],
+                mx.array(float("-inf"), logits.dtype),
+                axis=-1,
+            )
 
-        # Apply repetition penalty (matches HuggingFace RepetitionPenaltyLogitsProcessor)
+        # Apply repetition penalty
         if generated_tokens and repetition_penalty != 1.0:
-            logits_np = np.array(logits.astype(mx.float32))
-            for token in set(generated_tokens):
-                if token < logits_np.shape[-1]:
-                    score = logits_np[:, token]
-                    # Negative scores: multiply by penalty (more negative = less likely)
-                    # Positive scores: divide by penalty (smaller = less likely)
-                    logits_np[:, token] = np.where(
-                        score < 0,
-                        score * repetition_penalty,
-                        score / repetition_penalty,
-                    )
-            logits = mx.array(logits_np)
+            unique_tokens = list(set(generated_tokens))
+            valid_tokens = [t for t in unique_tokens if t < logits.shape[-1]]
+            if valid_tokens:
+                token_ids = mx.array(valid_tokens, dtype=mx.int32)
 
-        # Temperature scaling
-        if temperature > 0:
-            logits = logits / temperature
-        else:
+                selected_logits = mx.take(logits, token_ids, axis=-1)
+                penalized = mx.where(
+                    selected_logits < 0,
+                    selected_logits * repetition_penalty,
+                    selected_logits / repetition_penalty,
+                )
+
+                logits = mx.put_along_axis(
+                    logits, token_ids[None, :], penalized, axis=-1
+                )
+
+        # Greedy decoding if temperature is 0
+        if temperature <= 0:
             return mx.argmax(logits, axis=-1, keepdims=True)
 
-        # Save EOS logit before filtering (to preserve it as a valid candidate)
         eos_logit = None
         if eos_token_id is not None and eos_token_id < logits.shape[-1]:
             eos_logit = logits[:, eos_token_id : eos_token_id + 1]
 
-        # Top-k filtering
         if top_k > 0 and top_k < logits.shape[-1]:
-            top_k_vals = mx.topk(logits, k=top_k, axis=-1)
-            threshold = top_k_vals[:, -1:]
-            logits = mx.where(logits < threshold, float("-inf"), logits)
+            logits = apply_top_k(logits, top_k)
 
-        # Top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_logits = mx.sort(logits, axis=-1)[:, ::-1]
-            sorted_probs = mx.softmax(sorted_logits, axis=-1)
-            cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-            # Remove tokens with cumulative prob above threshold
-            sorted_mask = cumulative_probs > top_p
-            # Shift right to keep at least one token
-            sorted_mask = mx.concatenate(
-                [
-                    mx.zeros((sorted_mask.shape[0], 1), dtype=mx.bool_),
-                    sorted_mask[:, :-1],
-                ],
-                axis=-1,
-            )
-            threshold = mx.take_along_axis(
-                sorted_logits,
-                mx.argmax(sorted_mask.astype(mx.int32), axis=-1, keepdims=True),
-                axis=-1,
-            )
-            logits = mx.where(logits < threshold, float("-inf"), logits)
+        if 0.0 < top_p < 1.0:
+            logits = apply_top_p(logits, top_p)
 
-        # Restore EOS logit after filtering so it's always a valid candidate
+        if min_p > 0.0:
+            logits = apply_min_p(logits, min_p)
+
         if eos_logit is not None:
-            logits_np = np.array(logits.astype(mx.float32))
-            logits_np[:, eos_token_id] = np.array(
-                eos_logit.astype(mx.float32)
-            ).flatten()
-            logits = mx.array(logits_np)
+            eos_idx = mx.array([[eos_token_id]], dtype=mx.int32)
+            logits = mx.put_along_axis(logits, eos_idx, eos_logit, axis=-1)
 
-        # Sample from categorical distribution (takes logits directly)
-        return mx.random.categorical(logits)[:, None]
+        token = categorical_sampling(logits, temperature)
+        return token[:, None]
+
+    def _decode_chunk(self, codes: mx.array, chunk_tokens: int = 100) -> mx.array:
+        """Decode a chunk of codes to audio.
+
+        Args:
+            codes: [1, time, num_code_groups] codes to decode
+            chunk_tokens: Number of tokens per decode chunk (controls latency vs quality)
+
+        Returns:
+            audio: [samples] decoded audio waveform
+        """
+        audio_chunks = []
+        for chunk in self.speech_tokenizer.streaming_decode(
+            codes, chunk_tokens=chunk_tokens
+        ):
+            audio_chunks.append(chunk)
+
+        audio = mx.concatenate(audio_chunks, axis=-1)[0]  # Remove batch dim
+
+        # Calculate valid length and trim
+        valid_len = int(
+            (codes[..., 0] > 0).sum() * self.speech_tokenizer.decode_upsample_rate
+        )
+        if valid_len > 0 and valid_len < audio.shape[0]:
+            audio = audio[:valid_len]
+
+        mx.eval(audio)
+        return audio
 
     def generate(
         self,
@@ -684,7 +692,7 @@ class Model(nn.Module):
         temperature: float = 0.9,
         speed: float = 1.0,
         lang_code: str = "auto",
-        ref_audio: Optional[mx.array] = None,
+        ref_audio: Optional[Union[str, mx.array]] = None,
         ref_text: Optional[str] = None,
         split_pattern: str = "\n",
         max_tokens: int = 4096,
@@ -710,7 +718,7 @@ class Model(nn.Module):
             temperature: Sampling temperature
             speed: Speech speed factor (not directly supported yet)
             lang_code: Language code (auto, chinese, english, etc.)
-            ref_audio: Reference audio for voice cloning
+            ref_audio: Reference audio for voice cloning (file path or mx.array)
             ref_text: Reference text for voice cloning
             split_pattern: Pattern to split text into segments
             max_tokens: Maximum tokens per segment
@@ -724,6 +732,10 @@ class Model(nn.Module):
         Yields:
             GenerationResult objects with generated audio
         """
+        # Load reference audio if provided (handles file paths and mx.array)
+        if ref_audio is not None:
+            ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
+
         # Route to appropriate method based on model type
         tts_model_type = getattr(self.config, "tts_model_type", "base")
 
@@ -743,6 +755,8 @@ class Model(nn.Module):
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
                 verbose=verbose,
+                stream=stream,
+                streaming_interval=streaming_interval,
             )
             return
 
@@ -763,6 +777,8 @@ class Model(nn.Module):
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
                 verbose=verbose,
+                stream=stream,
+                streaming_interval=streaming_interval,
             )
             return
 
@@ -807,10 +823,14 @@ class Model(nn.Module):
         for segment_idx, segment_text in enumerate(segments):
             start_time = time.time()
 
-            if verbose:
-                print(
-                    f"Processing segment {segment_idx + 1}/{len(segments)}: {segment_text[:50]}..."
-                )
+            # Create progress bar for token generation
+            pbar = tqdm(
+                total=max_tokens,
+                desc=f"Segment {segment_idx + 1}/{len(segments)}",
+                unit="tokens",
+                disable=not verbose,
+                leave=False,
+            )
 
             # Prepare inputs
             input_embeds, trailing_text_hidden, tts_pad_embed = (
@@ -836,6 +856,12 @@ class Model(nn.Module):
                 for i in range(config.vocab_size - 1024, config.vocab_size)
                 if i != eos_token_id
             ]
+
+            # Streaming state
+            # At 12.5 Hz, 25 tokens ≈ 2 seconds of audio
+            streaming_chunk_size = max(1, int(streaming_interval * 12.5))
+            decoded_tokens = 0  # Track how many tokens we've decoded and yielded
+            context_size = 25  # Overlap tokens for smooth audio transitions (25 gives ~0.04% error vs full decode)
 
             for step in range(max_tokens):
                 # Forward pass through talker
@@ -905,6 +931,9 @@ class Model(nn.Module):
                 all_codes = mx.concatenate(code_tokens, axis=1)  # [1, num_code_groups]
                 generated_codes.append(all_codes)
 
+                del code_cache
+                mx.clear_cache()
+
                 # Prepare next input
                 # Add trailing text if available
                 if trailing_idx < trailing_text_hidden.shape[1]:
@@ -927,21 +956,109 @@ class Model(nn.Module):
 
                 mx.eval(input_embeds)
 
-                if verbose and step % 100 == 0:
-                    print(f"  Step {step}, generated {len(generated_codes)} tokens")
+                # Periodically clear cache to prevent memory buildup during long generation
+                if step > 0 and step % 50 == 0:
+                    mx.clear_cache()
+
+                # Update progress bar
+                pbar.update(1)
+
+                # Streaming: decode and yield audio chunks during generation
+                new_tokens = len(generated_codes) - decoded_tokens
+                if stream and new_tokens >= streaming_chunk_size:
+                    # Include context from previous tokens for smooth transitions
+                    start_idx = max(0, decoded_tokens - context_size)
+                    codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+                    mx.eval(codes_chunk)
+
+                    audio_chunk = self._decode_chunk(
+                        codes_chunk, chunk_tokens=streaming_chunk_size
+                    )
+
+                    # Trim the context overlap from audio (only yield new audio)
+                    if decoded_tokens > 0 and start_idx < decoded_tokens:
+                        context_tokens = decoded_tokens - start_idx
+                        samples_per_token = self.speech_tokenizer.decode_upsample_rate
+                        trim_samples = context_tokens * samples_per_token
+                        if trim_samples < audio_chunk.shape[0]:
+                            audio_chunk = audio_chunk[trim_samples:]
+
+                    decoded_tokens = len(generated_codes)
+
+                    yield GenerationResult(
+                        audio=audio_chunk,
+                        samples=audio_chunk.shape[0],
+                        sample_rate=self.sample_rate,
+                        segment_idx=segment_idx,
+                        token_count=new_tokens,
+                        audio_duration=format_duration(
+                            audio_chunk.shape[0] / self.sample_rate
+                        ),
+                        real_time_factor=0,
+                        prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+                        audio_samples={
+                            "samples": audio_chunk.shape[0],
+                            "samples-per-sec": 0,
+                        },
+                        processing_time_seconds=0,
+                        peak_memory_usage=mx.get_peak_memory() / 1e9,
+                        is_streaming_chunk=True,
+                    )
+
+                    mx.clear_cache()
+
+            pbar.close()
+
+            # Yield any remaining tokens
+            if stream and len(generated_codes) > decoded_tokens:
+                # Include context from previous tokens for smooth transitions
+                start_idx = max(0, decoded_tokens - context_size)
+                codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+                mx.eval(codes_chunk)
+
+                audio_chunk = self._decode_chunk(
+                    codes_chunk, chunk_tokens=streaming_chunk_size
+                )
+
+                # Trim the context overlap from audio (only yield new audio)
+                if decoded_tokens > 0 and start_idx < decoded_tokens:
+                    context_tokens = decoded_tokens - start_idx
+                    samples_per_token = self.speech_tokenizer.decode_upsample_rate
+                    trim_samples = context_tokens * samples_per_token
+                    if trim_samples < audio_chunk.shape[0]:
+                        audio_chunk = audio_chunk[trim_samples:]
+
+                new_tokens = len(generated_codes) - decoded_tokens
+
+                yield GenerationResult(
+                    audio=audio_chunk,
+                    samples=audio_chunk.shape[0],
+                    sample_rate=self.sample_rate,
+                    segment_idx=segment_idx,
+                    token_count=new_tokens,
+                    audio_duration=format_duration(
+                        audio_chunk.shape[0] / self.sample_rate
+                    ),
+                    real_time_factor=0,
+                    prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+                    audio_samples={
+                        "samples": audio_chunk.shape[0],
+                        "samples-per-sec": 0,
+                    },
+                    processing_time_seconds=0,
+                    peak_memory_usage=mx.get_peak_memory() / 1e9,
+                    is_streaming_chunk=True,
+                    is_final_chunk=True,
+                )
+                continue  # Skip non-streaming yield
 
             if not generated_codes:
-                if verbose:
-                    print(f"  No codes generated for segment {segment_idx}")
                 continue
 
             # Stack all generated codes
             codes = mx.stack(generated_codes, axis=1)  # [1, seq_len, num_code_groups]
 
-            if verbose:
-                print(f"  Decoding {codes.shape[1]} tokens to audio...")
-
-            # Decode to audio
+            # Non-streaming: decode all at once
             audio, audio_lengths = self.speech_tokenizer.decode(codes)
             audio = audio[0]  # Remove batch dim
 
@@ -1002,6 +1119,8 @@ class Model(nn.Module):
         top_p: float = 1.0,
         repetition_penalty: float = 1.05,
         verbose: bool = False,
+        stream: bool = False,
+        streaming_interval: float = 2.0,
     ) -> Generator[GenerationResult, None, None]:
         """Generate speech with the CustomVoice model using a predefined speaker.
 
@@ -1044,7 +1163,10 @@ class Model(nn.Module):
             )
 
         # For 0.6B models, instruct is not supported
-        if self.config.tts_model_size == "0b6":
+        if (
+            self.config.tts_model_size == "0b6"
+            and self.config.tts_model_type != "custom_voice"
+        ):
             instruct = None
 
         yield from self._generate_with_instruct(
@@ -1058,6 +1180,8 @@ class Model(nn.Module):
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             verbose=verbose,
+            stream=stream,
+            streaming_interval=streaming_interval,
         )
 
     def generate_voice_design(
@@ -1071,6 +1195,8 @@ class Model(nn.Module):
         top_p: float = 1.0,
         repetition_penalty: float = 1.05,
         verbose: bool = False,
+        stream: bool = False,
+        streaming_interval: float = 2.0,
     ) -> Generator[GenerationResult, None, None]:
         """Generate speech with the VoiceDesign model using natural language voice description.
 
@@ -1115,6 +1241,8 @@ class Model(nn.Module):
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             verbose=verbose,
+            stream=stream,
+            streaming_interval=streaming_interval,
         )
 
     def _generate_icl(
@@ -1140,7 +1268,6 @@ class Model(nn.Module):
 
         if verbose:
             print(f"ICL generation: {text[:50]}...")
-            print(f"  Reference text: {ref_text[:50]}...")
 
         # Prepare ICL inputs
         input_embeds, trailing_text_hidden, tts_pad_embed, ref_codes = (
@@ -1152,23 +1279,12 @@ class Model(nn.Module):
             )
         )
 
-        if verbose:
-            print(
-                f"  Encoded reference: {ref_codes.shape[2]} frames, "
-                f"input sequence: {input_embeds.shape[1]} tokens"
-            )
-
         # Cap max_tokens based on target text length to prevent runaway generation
         # when reference audio is long and EOS logit is suppressed by top-k.
         # At 12.5 Hz codec rate, ~3-5 codec tokens per text token is typical speech.
         # Factor of 6 gives ~50% margin for slow speech / pauses.
         target_token_count = len(self.tokenizer.encode(text))
         effective_max_tokens = min(max_tokens, max(75, target_token_count * 6))
-        if verbose and effective_max_tokens < max_tokens:
-            print(
-                f"  Effective max_tokens: {effective_max_tokens} "
-                f"(based on {target_token_count} text tokens)"
-            )
 
         # Initialize cache
         cache = self.talker.make_cache()
@@ -1181,6 +1297,15 @@ class Model(nn.Module):
             if i != eos_token_id
         ]
         trailing_idx = 0
+
+        # Create progress bar for token generation
+        pbar = tqdm(
+            total=effective_max_tokens,
+            desc="ICL Generation",
+            unit="tokens",
+            disable=not verbose,
+            leave=False,
+        )
 
         for step in range(effective_max_tokens):
             # Forward pass through talker
@@ -1253,12 +1378,11 @@ class Model(nn.Module):
             input_embeds = text_embed + codec_embed
             mx.eval(input_embeds)
 
-            if verbose and step % 100 == 0:
-                print(f"  Step {step}, generated {len(generated_codes)} tokens")
+            pbar.update(1)
+
+        pbar.close()
 
         if not generated_codes:
-            if verbose:
-                print("  No codes generated")
             return
 
         # Stack generated codes
@@ -1272,12 +1396,6 @@ class Model(nn.Module):
 
         ref_len = ref_codes.shape[2]
         total_len = full_codes.shape[1]
-
-        if verbose:
-            print(
-                f"  Decoding {total_len} tokens "
-                f"({ref_len} ref + {gen_codes.shape[1]} gen) to audio..."
-            )
 
         # Decode full codes to audio
         audio, audio_lengths = self.speech_tokenizer.decode(full_codes)
@@ -1339,17 +1457,14 @@ class Model(nn.Module):
         top_p: float,
         repetition_penalty: float,
         verbose: bool,
+        stream: bool = False,
+        streaming_interval: float = 2.0,
     ) -> Generator[GenerationResult, None, None]:
         """Internal method for generation with instruct support."""
         if self.speech_tokenizer is None:
             raise ValueError("Speech tokenizer not loaded")
 
         start_time = time.time()
-
-        if verbose:
-            print(f"Generating: {text[:50]}...")
-            if instruct:
-                print(f"  Instruct: {instruct[:50]}...")
 
         # Prepare inputs with instruct
         input_embeds, trailing_text_hidden, tts_pad_embed = (
@@ -1360,6 +1475,13 @@ class Model(nn.Module):
                 instruct=instruct,
             )
         )
+
+        # Cap max_tokens based on target text length to prevent runaway generation
+        # when EOS logit doesn't become dominant (seen especially with 0.6B model).
+        # At 12.5 Hz codec rate, ~3-5 codec tokens per text token is typical speech.
+        # Factor of 6 gives ~50% margin for slow speech / pauses.
+        target_token_count = len(self.tokenizer.encode(text))
+        effective_max_tokens = min(max_tokens, max(75, target_token_count * 6))
 
         # Initialize cache
         cache = self.talker.make_cache()
@@ -1373,7 +1495,22 @@ class Model(nn.Module):
         ]
         trailing_idx = 0
 
-        for step in range(max_tokens):
+        # Streaming state
+        # At 12.5 Hz, 25 tokens ≈ 2 seconds of audio
+        streaming_chunk_size = max(1, int(streaming_interval * 12.5))
+        decoded_tokens = 0  # Track how many tokens we've decoded and yielded
+        context_size = 25  # Overlap tokens for smooth audio transitions (25 gives ~0.04% error vs full decode)
+
+        # Create progress bar for token generation
+        pbar = tqdm(
+            total=effective_max_tokens,
+            desc="Generating",
+            unit="tokens",
+            disable=not verbose,
+            leave=False,
+        )
+
+        for step in range(effective_max_tokens):
             # Forward pass through talker
             logits, hidden = self.talker(input_embeds, cache=cache)
 
@@ -1428,6 +1565,9 @@ class Model(nn.Module):
             all_codes = mx.concatenate(code_tokens, axis=1)
             generated_codes.append(all_codes)
 
+            del code_cache
+            mx.clear_cache()
+
             # Prepare next input
             if trailing_idx < trailing_text_hidden.shape[1]:
                 text_embed = trailing_text_hidden[:, trailing_idx : trailing_idx + 1, :]
@@ -1444,23 +1584,108 @@ class Model(nn.Module):
             input_embeds = text_embed + codec_embed
             mx.eval(input_embeds)
 
-            if verbose and step % 100 == 0:
-                print(f"  Step {step}, generated {len(generated_codes)} tokens")
+            # Periodically clear cache to prevent memory buildup during long generation
+            if step > 0 and step % 50 == 0:
+                mx.clear_cache()
+
+            pbar.update(1)
+
+            # Streaming: decode and yield audio chunks during generation
+            new_tokens = len(generated_codes) - decoded_tokens
+            if stream and new_tokens >= streaming_chunk_size:
+                # Include context from previous tokens for smooth transitions
+                start_idx = max(0, decoded_tokens - context_size)
+                codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+                mx.eval(codes_chunk)
+
+                audio_chunk = self._decode_chunk(
+                    codes_chunk, chunk_tokens=streaming_chunk_size
+                )
+
+                # Trim the context overlap from audio (only yield new audio)
+                if decoded_tokens > 0 and start_idx < decoded_tokens:
+                    context_tokens = decoded_tokens - start_idx
+                    samples_per_token = self.speech_tokenizer.decode_upsample_rate
+                    trim_samples = context_tokens * samples_per_token
+                    if trim_samples < audio_chunk.shape[0]:
+                        audio_chunk = audio_chunk[trim_samples:]
+
+                decoded_tokens = len(generated_codes)
+
+                yield GenerationResult(
+                    audio=audio_chunk,
+                    samples=audio_chunk.shape[0],
+                    sample_rate=self.sample_rate,
+                    segment_idx=0,
+                    token_count=new_tokens,
+                    audio_duration=format_duration(
+                        audio_chunk.shape[0] / self.sample_rate
+                    ),
+                    real_time_factor=0,
+                    prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+                    audio_samples={
+                        "samples": audio_chunk.shape[0],
+                        "samples-per-sec": 0,
+                    },
+                    processing_time_seconds=0,
+                    peak_memory_usage=mx.get_peak_memory() / 1e9,
+                    is_streaming_chunk=True,
+                )
+
+                mx.clear_cache()
+
+        pbar.close()
+
+        # Yield any remaining tokens for streaming mode
+        if stream and len(generated_codes) > decoded_tokens:
+            # Include context from previous tokens for smooth transitions
+            start_idx = max(0, decoded_tokens - context_size)
+            codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+            mx.eval(codes_chunk)
+
+            audio_chunk = self._decode_chunk(
+                codes_chunk, chunk_tokens=streaming_chunk_size
+            )
+
+            # Trim the context overlap from audio (only yield new audio)
+            if decoded_tokens > 0 and start_idx < decoded_tokens:
+                context_tokens = decoded_tokens - start_idx
+                samples_per_token = self.speech_tokenizer.decode_upsample_rate
+                trim_samples = context_tokens * samples_per_token
+                if trim_samples < audio_chunk.shape[0]:
+                    audio_chunk = audio_chunk[trim_samples:]
+
+            new_tokens = len(generated_codes) - decoded_tokens
+
+            yield GenerationResult(
+                audio=audio_chunk,
+                samples=audio_chunk.shape[0],
+                sample_rate=self.sample_rate,
+                segment_idx=0,
+                token_count=new_tokens,
+                audio_duration=format_duration(audio_chunk.shape[0] / self.sample_rate),
+                real_time_factor=0,
+                prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+                audio_samples={
+                    "samples": audio_chunk.shape[0],
+                    "samples-per-sec": 0,
+                },
+                processing_time_seconds=0,
+                peak_memory_usage=mx.get_peak_memory() / 1e9,
+                is_streaming_chunk=True,
+                is_final_chunk=True,
+            )
+            return  # Skip non-streaming yield
 
         if not generated_codes:
-            if verbose:
-                print("  No codes generated")
             return
 
         # Stack all generated codes
         codes = mx.stack(generated_codes, axis=1)
 
-        if verbose:
-            print(f"  Decoding {codes.shape[1]} tokens to audio...")
-
-        # Decode to audio
+        # Non-streaming: decode all at once
         audio, audio_lengths = self.speech_tokenizer.decode(codes)
-        audio = audio[0]
+        audio = audio[0]  # Remove batch dim
 
         # Trim to valid length
         valid_len = int(audio_lengths[0])
@@ -1505,53 +1730,13 @@ class Model(nn.Module):
         Args:
             path: Local path or Hugging Face repo ID (e.g., 'Qwen/Qwen3-TTS-0.6B-Base')
         """
-        from huggingface_hub import snapshot_download
-        from safetensors import safe_open
 
-        path = Path(path)
+        from mlx_audio.tts.utils import load
 
-        # Download from Hugging Face if not a local path
-        if not path.exists():
-            print(f"Downloading model from Hugging Face: {path}...")
-            path = Path(
-                snapshot_download(
-                    repo_id=str(path),
-                    allow_patterns=[
-                        "*.safetensors",
-                        "*.json",
-                        "*.txt",
-                        "*.model",
-                        "speech_tokenizer/*",
-                    ],
-                )
-            )
-            print(f"Model downloaded to: {path}")
-
-        # Load config
-        with open(path / "config.json") as f:
-            config_dict = json.load(f)
-
-        config = ModelConfig.from_dict(config_dict)
-        model = cls(config)
-
-        # Load weights - use PyTorch as intermediate for bfloat16 support
-        weights = {}
-        weight_files = list(path.glob("*.safetensors"))
-        if len(weight_files) == 0:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        for wf in weight_files:
-            weights.update(mx.load(str(wf)))
-
-        # Sanitize and load
-        weights = model.sanitize(weights)
-
-        model.load_weights(list(weights.items()))
-
-        # Call post_load_hook to initialize tokenizer and speech tokenizer
-        model = cls.post_load_hook(model, path)
-
-        return model
+        print(
+            "WARNING: Loading model from pretrained weights is deprecated. Use mlx_audio.tts.utils.load instead."
+        )
+        return load(path)
 
     @classmethod
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":
@@ -1582,12 +1767,6 @@ class Model(nn.Module):
                         tokenizer_config_dict["decoder_config"],
                     )
                     decoder_config = Qwen3TTSTokenizerDecoderConfig(**filtered)
-                if "encoder_config" in tokenizer_config_dict:
-                    filtered = filter_dict_for_dataclass(
-                        Qwen3TTSTokenizerEncoderConfig,
-                        tokenizer_config_dict["encoder_config"],
-                    )
-                    encoder_config = Qwen3TTSTokenizerEncoderConfig(**filtered)
 
                 tokenizer_config = Qwen3TTSTokenizerConfig(
                     encoder_config=encoder_config,

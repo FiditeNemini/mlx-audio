@@ -46,16 +46,16 @@ pip install -e ".[dev]"
 
 ```bash
 # Basic TTS generation
-mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text "Hello, world!" --lang_code a
+mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text 'Hello, world!' --lang_code a
 
 # With voice selection and speed adjustment
-mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text "Hello!" --voice af_heart --speed 1.2 --lang_code a
+mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text 'Hello!' --voice af_heart --speed 1.2 --lang_code a
 
 # Play audio immediately
-mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text "Hello!" --play  --lang_code a
+mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text 'Hello!' --play  --lang_code a
 
 # Save to a specific directory
-mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text "Hello!" --output_path ./my_audio  --lang_code a
+mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 --text 'Hello!' --output_path ./my_audio  --lang_code a
 ```
 
 ### Python API
@@ -175,11 +175,13 @@ mlx_audio.tts.generate \
 ### Whisper STT
 
 ```python
-from mlx_audio.stt.utils import load_model, transcribe
+from mlx_audio.stt.generate import generate_transcription
 
-model = load_model("mlx-community/whisper-large-v3-turbo-asr-fp16")
-result = transcribe("audio.wav", model=model)
-print(result["text"])
+result = generate_transcription(
+    model="mlx-community/whisper-large-v3-turbo-asr-fp16",
+    audio="audio.wav",
+)
+print(result.text)
 ```
 
 ### VibeVoice-ASR
@@ -318,16 +320,6 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 
 ## Quantization
 
-- MLX
-- Python 3.8+
-- Apple Silicon Mac (for optimal performance)
-- For the web interface and API:
-  - FastAPI
-  - Uvicorn
-
-## Swift
-
-Looking for Swift/iOS support? Check out [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) for on-device TTS using MLX on macOS and iOS.
 Reduce model size and improve performance with quantization using the convert script:
 
 ```bash
@@ -358,6 +350,9 @@ python -m mlx_audio.convert \
 | `--dtype` | Weight dtype: `float16`, `bfloat16`, `float32` |
 | `--upload-repo` | Upload converted model to HF Hub |
 
+## Swift
+
+Looking for Swift/iOS support? Check out [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) for on-device TTS using MLX on macOS and iOS.
 
 ## Requirements
 

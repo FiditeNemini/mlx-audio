@@ -1049,6 +1049,47 @@ class Qwen3TTSSpeechTokenizer(nn.Module):
 
         return wav, audio_lengths
 
+    def streaming_decode(self, audio_codes: mx.array, chunk_tokens: int = 100):
+        """
+        Decode audio codes to waveform in a streaming fashion.
+
+        Yields audio chunks as they're decoded, reducing peak memory usage.
+
+        Args:
+            audio_codes: [batch, time, num_quantizers]
+            chunk_tokens: Number of tokens to decode per chunk
+
+        Yields:
+            audio_chunk: [batch, samples] decoded audio for each chunk
+        """
+        # Transpose to [batch, num_quantizers, time]
+        codes = mx.transpose(audio_codes, (0, 2, 1))
+        total_tokens = codes.shape[-1]
+        left_context_size = 25
+
+        start_index = 0
+        while start_index < total_tokens:
+            end_index = min(start_index + chunk_tokens, total_tokens)
+            context_size = (
+                left_context_size
+                if start_index - left_context_size > 0
+                else start_index
+            )
+            codes_chunk = codes[..., start_index - context_size : end_index]
+            wav_chunk = self.decoder(codes_chunk)
+            wav_chunk = wav_chunk[..., context_size * self.decoder.total_upsample :]
+            wav_chunk = wav_chunk.squeeze(1)
+
+            # Evaluate immediately to free computation graph
+            mx.eval(wav_chunk)
+
+            yield wav_chunk
+
+            # Clear cache after each chunk
+            mx.clear_cache()
+
+            start_index = end_index
+
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Sanitize weights from PyTorch to MLX format."""
